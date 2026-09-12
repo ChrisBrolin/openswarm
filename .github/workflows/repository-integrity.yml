@@ -1,0 +1,214 @@
+name: Repository integrity
+
+# Inspect Git objects as data. No project checkout, dependencies, or project code execution.
+# Mandatory merge/push protection still requires GitHub administrator configuration.
+on:
+  push:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      maintenance:
+        description: Whether the inspected head is a security maintenance commit
+        value: ${{ jobs.repository_integrity.outputs.maintenance }}
+
+permissions:
+  contents: read
+
+jobs:
+  repository_integrity:
+    name: repository-integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      maintenance: ${{ steps.scan.outputs.maintenance }}
+    steps:
+      - name: Inspect immutable source without running it
+        id: scan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          
+          BAD_BLOBS = frozenset({
+              '6df5b2c9c172d3b822494c3ef9083dbfc135ecf6',
+              '0272b9f2b1a0dda93baebf3bae505e22959a5464',
+              '5e226620d2e360205cc8634e3c581a008d382561',
+              '934d55548c36ff0e330f2a2ba69bf74b10a7dcba',
+              '2a66363f80deddefd6cf676e4a09d8da30fd485a',
+          })
+          BAD_TEXT = tuple(bytes.fromhex(h).decode('ascii') for h in (
+              '41382d2a23',
+              '41382d343032312d3333',
+              '307861333232653566336433313164333038306536663031323130363365396164633234393065663161',
+              '782d7061796c6f61642d623634',
+              '544d664b51456437544a4a6135784e5a4a5a324c657038333876727a7273376d4150',
+              '545866784855657439704a5655314267566b42416272455334595563316e477a6347',
+          ))
+          BAD_IGNORE = {'branch_structure.json', 'temp_auto_push.bat', 'temp_interactive_push.bat'}
+          POLICY_PATH = '.github/workflows/repository-integrity.yml'
+          
+          
+          def git(repo, *args, env=None):
+              p = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '--git-dir=' + repo, *args],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+              if p.returncode:
+                  raise RuntimeError('Git read/fetch failed; refusing to report a clean snapshot')
+              return p.stdout
+          
+          
+          def inspect_chunk(path, raw):
+              text = raw.decode('utf-8', errors='replace')
+              text = re.sub(r'\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})',
+                            lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+              low = text.lower()
+              if any(s.lower() in low for s in BAD_TEXT):
+                  return 'known campaign content'
+              if path.rsplit('/', 1)[-1] == '.gitignore':
+                  if any(line.strip().lstrip('/') in BAD_IGNORE for line in text.splitlines()):
+                      return 'campaign concealment rule'
+              if '/.vscode/' in '/' + path or path.endswith('.code-workspace'):
+                  if re.search(r'["\']runOn["\']\s*:\s*["\']folderOpen["\']', text):
+                      return 'editor folder-open task'
+                  if re.search(r'["\']task\.allowAutomaticTasks["\']\s*:\s*(?:true\b|["\']on["\'])', text):
+                      return 'automatic editor tasks enabled'
+              if re.search(r'(?:^|/)[^/]*\.config\.(?:[cm]?[jt]s)$', path):
+                  if re.search(r'\beval\s*\(|\bnew\s+Function\s*\(|child_process', text):
+                      return 'dynamic execution in tool configuration requires review'
+                  if re.search(r'[^\n][ \t]{300,}\S', text):
+                      return 'concealed long-whitespace configuration content'
+              return None
+          
+          
+          def scan(repo, sha, env=None):
+              records = git(repo, 'ls-tree', '-r', '-z', '--full-tree', sha, env=env).split(b'\0')
+              entries = []
+              issues = []
+              for record in records:
+                  if not record:
+                      continue
+                  meta, name = record.split(b'\t', 1)
+                  mode, kind, oid = meta.split()
+                  path = name.decode('utf-8', errors='replace')
+                  if kind != b'blob':
+                      continue
+                  oid = oid.decode('ascii')
+                  if not re.fullmatch('[0-9a-f]{40}', oid):
+                      raise RuntimeError('Unexpected object identifier')
+                  entries.append((path, oid))
+                  if oid in BAD_BLOBS:
+                      issues.append((path, 'known malicious blob'))
+                  if path.lower().endswith('/fa-solid-400.woff2') or path.lower() == 'fa-solid-400.woff2':
+                      issues.append((path, 'reserved known implant filename'))
+              p = subprocess.Popen(['git', '-c', 'core.hooksPath=/dev/null', '--git-dir=' + repo,
+                                    'cat-file', '--batch'], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+              try:
+                  for path, oid in entries:
+                      p.stdin.write((oid + '\n').encode('ascii'))
+                      p.stdin.flush()
+                      header = p.stdout.readline().split()
+                      if len(header) != 3 or header[0].decode() != oid or header[1] != b'blob':
+                          raise RuntimeError('Incomplete object read')
+                      remaining = int(header[2])
+                      carry = b''
+                      first = True
+                      reason = None
+                      while remaining:
+                          block = p.stdout.read(min(1024 * 1024, remaining))
+                          if not block:
+                              raise RuntimeError('Truncated blob')
+                          remaining -= len(block)
+                          if first:
+                              first = False
+                              ext = path.lower().rsplit('.', 1)[-1]
+                              allowed = {'woff': (b'wOFF',), 'woff2': (b'wOF2',),
+                                         'ttf': (b'\x00\x01\x00\x00', b'true', b'ttcf', b'OTTO'),
+                                         'otf': (b'OTTO', b'\x00\x01\x00\x00', b'ttcf')}
+                              if ext in allowed and block[:4] not in allowed[ext]:
+                                  reason = 'font extension does not match binary signature'
+                          reason = reason or inspect_chunk(path, carry + block)
+                          carry = block[-4096:]
+                      if first and path.lower().endswith(('.woff', '.woff2', '.ttf', '.otf')):
+                          reason = 'empty font file'
+                      if p.stdout.read(1) != b'\n':
+                          raise RuntimeError('Invalid object boundary')
+                      if reason:
+                          issues.append((path, reason))
+                  p.stdin.close()
+                  if p.wait(timeout=30):
+                      raise RuntimeError('Object reader failed')
+              finally:
+                  if p.poll() is None:
+                      p.kill()
+                      p.wait()
+              return len(entries), sorted(set(issues))
+          
+          
+          def main():
+              repository = os.environ['GITHUB_REPOSITORY']
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+                  raise RuntimeError('Invalid repository name')
+              with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
+                  event = json.load(f)
+              pr = event.get('pull_request')
+              target = pr['head']['sha'] if pr and os.environ.get('GITHUB_EVENT_NAME') == 'pull_request_target' else os.environ['GITHUB_SHA']
+              if not re.fullmatch(r'[0-9a-fA-F]{40}', target):
+                  raise RuntimeError('Expected an immutable commit SHA')
+              auth = base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode()
+              env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TMPDIR') if k in os.environ}
+              env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0',
+                         GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                         GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + auth)
+              with tempfile.TemporaryDirectory(prefix='repository-integrity-') as repo:
+                  git(repo, 'init', '--bare', repo, env=env)
+                  git(repo, 'fetch', '--quiet', '--no-tags', '--depth=1',
+                      'https://github.com/' + repository + '.git', target, env=env)
+                  count, issues = scan(repo, target, env=env)
+                  message_sha = pr['head']['sha'] if pr else target
+                  if not re.fullmatch(r'[0-9a-fA-F]{40}', message_sha):
+                      raise RuntimeError('Invalid pull-request head')
+                  if message_sha != target:
+                      git(repo, 'fetch', '--quiet', '--no-tags', '--depth=1',
+                          'https://github.com/' + repository + '.git', message_sha, env=env)
+                  message = git(repo, 'show', '--no-patch', '--format=%B', message_sha, env=env).decode('utf-8', errors='replace')
+                  maintenance = '[security-maintenance]' in message
+                  if pr:
+                      baseline = pr['base']['sha']
+                      if not re.fullmatch(r'[0-9a-fA-F]{40}', baseline):
+                          raise RuntimeError('Invalid base commit')
+                      git(repo, 'fetch', '--quiet', '--no-tags', '--depth=1',
+                          'https://github.com/' + repository + '.git', baseline, env=env)
+                      old = git(repo, 'ls-tree', baseline, '--', POLICY_PATH, env=env)
+                      new = git(repo, 'ls-tree', target, '--', POLICY_PATH, env=env)
+                      if old and old != new:
+                          issues.append((POLICY_PATH, 'integrity policy changed; requires administrator review'))
+                  if os.environ.get('GITHUB_OUTPUT'):
+                      with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+                          f.write('maintenance=' + str(maintenance).lower() + '\n')
+                  print('Inspected immutable commit ' + target + '; blobs=' + str(count))
+                  if issues:
+                      for path, reason in issues[:50]:
+                          print('REJECT ' + json.dumps({'path': path, 'reason': reason}, ensure_ascii=True))
+                      raise SystemExit(1)
+                  print('PASS: known campaign and automatic-execution checks. Not a general malware or device clearance.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except (KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+                  print('Integrity check could not complete; refusing to report success.')
+                  raise SystemExit(2)
+          PY
